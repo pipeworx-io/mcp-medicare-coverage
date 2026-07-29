@@ -1,0 +1,20 @@
+{
+  "name": "@pipeworx/mcp-medicare-coverage",
+  "version": "0.1.0",
+  "description": "Medicare coverage policy from CMS: national and local coverage determinations, plus open analyses",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "medicare-coverage"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pipeworx-io/mcp-medicare-coverage"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

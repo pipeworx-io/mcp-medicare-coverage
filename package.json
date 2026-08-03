@@ -1,7 +1,7 @@
 {
   "name": "@pipeworx/mcp-medicare-coverage",
-  "version": "0.1.0",
-  "description": "Medicare coverage policy from CMS: national and local coverage determinations, plus open analyses",
+  "version": "0.1.3",
+  "description": "MCP server for medicare-coverage",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",

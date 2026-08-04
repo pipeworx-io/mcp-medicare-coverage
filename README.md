@@ -1,8 +1,8 @@
 # mcp-medicare-coverage
 
-MCP server for medicare-coverage
+MCP server for Medicare Coverage
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1395+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1394+ live data sources.
 
 ## Tools
 
@@ -18,7 +18,7 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 | `medicare_coverage_states` | List CMS Coverage API state identifiers used to scope local Medicare coverage searches. |
 | `medicare_article_code_profile` | Retrieve one CMS Medicare Coverage Article with its CPT/HCPCS codes and contractor records. Licensed AMA/ADA/AHA content requires a caller-provided CMS license token. Code inclusion describes billing guidance, not guaranteed coverage or payment. |
 | `medicare_local_coverage_variation` | Compare final LCD search matches across 1–15 states and Medicare Administrative Contractors. Different matching document counts or titles are policy signals, not proof of unequal beneficiary access or payment. |
-| `medicare_coverage_timeline` | Retrieve official CMS version or revision history for a Medicare NCD, NCA, CAL, or LCD. Accepts either identifier CMS publishes for a coverage document: the public one that appears in the policy text and in every citation of it — an NCD section number such as 310.1 or 90.2, an NCA/CAL tracking number such as CAG-00450N, an LCD number such as L34246 — or CMS\'s internal numeric document id. Public identifiers are resolved to the internal id automatically, and every response reports the resolved internal document_id alongside the public document_display_id and the document title so a caller can confirm the policy matches the one they asked about. LCD revision history requires a caller-supplied CMS license token. Timeline entries describe policy publication and revision history; utilization, payment, and claim-level adjudication come from other tools. |
+| `medicare_coverage_timeline` | Retrieve official CMS version or revision history for an NCD, NCA, CAL, or LCD. LCD revision history requires a caller-provided CMS license token. Timeline entries describe policy publication history, not claims adjudication. |
 | `medicare_hcpcs_utilization_trend` | Show annual Medicare Physician & Other Practitioners national utilization and payment metrics for one HCPCS code. Claims are fee-for-service aggregates with suppression and methodology limits; they do not measure total US use, coverage, demand, or company revenue. |
 | `medicare_hcpcs_geography` | Compare state-level Medicare fee-for-service provider, beneficiary, service, and average-payment metrics for one HCPCS code and program year. State beneficiary counts across places of service must not be summed as unique people. |
 | `medicare_provider_exposure` | Return a bounded sample of provider-level Medicare fee-for-service rows for one HCPCS code, optionally filtered by state, with the authoritative matching-row count. This is not a provider ranking and excludes suppressed/non-FFS activity. |
@@ -49,7 +49,7 @@ Add to your MCP client (Claude Desktop, Cursor, Windsurf, etc.):
 }
 ```
 
-Or connect to the full Pipeworx gateway for access to all 1395+ data sources:
+Or connect to the full Pipeworx gateway for access to all 1394+ data sources:
 
 ```json
 {
@@ -73,7 +73,7 @@ The gateway picks the right tool and fills the arguments automatically.
 
 ## More
 
-- [All tools and guides](https://github.com/pipeworx-io/examples)
+- [Docs and guides](https://pipeworx.io/docs)
 - [pipeworx.io](https://pipeworx.io)
 
 ## License

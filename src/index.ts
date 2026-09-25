@@ -1,6 +1,10 @@
 interface McpToolDefinition {
   name: string;
   description: string;
+  /** Human-facing one-liner (fleet #1967). Optional; consumers fall back to
+   *  description. Kept in step with shared/src/types.ts — scripts/lib/
+   *  check-inlined-types.mjs reports drift at publish time. */
+  summary?: string;
   inputSchema: {
     type: 'object';
     properties: Record<string, unknown>;
@@ -19,6 +23,203 @@ interface McpToolExport {
   cost?: Record<string, unknown>;
   provider?: string;
 }
+
+/**
+ * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
+ *
+ * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
+ * keying on the SQLSTATE inside PostgREST's four-key error envelope. That
+ * covered the majority and structurally could not cover the rest: the rest
+ * never reach Postgres, so they carry no SQLSTATE. What was left, measured over
+ * the 24h to 2026-09-02T15:00Z (fleet #1096):
+ *
+ *     5  pipeworx-catalog  get_pack_tools     Pipeworx catalog error: 522 — error code: 522
+ *     3  fleet             fleet_list_open …  upstream_down: Fleet task queue did not respond within 25s
+ *
+ * 521/522/523/526 are Cloudflare saying its edge could not reach an ORIGIN, and
+ * in both of those rows the origin is ours — `gateway.pipeworx.io` for the
+ * catalog pack (it self-fetches when the gateway hasn't injected a manifest),
+ * our own Supabase for fleet. There is no third party anywhere in either call.
+ * Same defect as #1089: our own outage filed under `upstream_down`, the one
+ * class that means "the source is unreachable and there is nothing for us to
+ * fix", which is why the problem-tools triage skips it.
+ *
+ * WHY NOT A WORDING RULE. The obvious fix is to match `fleet db error:` and
+ * `Pipeworx catalog error:` in classifyToolError. Each is emitted from exactly
+ * one site today, so it would work today. It would also rot the first time
+ * somebody rewords a label — silently, and in the direction of hiding our own
+ * outage, which is worse than the bug being fixed. Every prose rule in
+ * error-class.ts has needed widening as packs invented new wording (#409/#450/
+ * #584); that history is most of that file's comment budget.
+ *
+ * WHAT THIS KEYS ON INSTEAD: **the host the call actually reached.** A URL's
+ * hostname is a fact about the call, not a guess about its prose. Two
+ * consequences that a pack-level flag could not give us, and the reason the
+ * flag was rejected:
+ *
+ *   - It describes the CALL, not the pack. `govcon-intel` fans out to our own
+ *     Supabase AND to genuine third parties; `court-listener` holds our cache
+ *     in Supabase and fetches courtlistener.com. An `internallyHosted: true` on
+ *     either pack would relabel a real third-party outage as ours — inventing
+ *     work, which is the same class of error in the opposite direction.
+ *   - It covers every future internal pack for free, instead of one declared
+ *     slug at a time.
+ *
+ * WHY IT SURVIVES A REWORD. The marker below is not matched as a literal by two
+ * separate files. `markInternalOrigin()` writes it and `internalHostMetricsClass()`
+ * reads it, both from the single exported `INTERNAL_ORIGIN_MARKER` constant in
+ * this module — so changing the wording changes both sides in the same edit and
+ * cannot desynchronise them. The pack's own label (`fleet db error:`,
+ * `Pipeworx catalog error:`) is not read at all: reword it freely, the class is
+ * unaffected. That is the property `stripClassPrefix` lacked when it drifted
+ * from its own classifier three times and needed a CI gate to hold them
+ * together.
+ *
+ * WHERE THE 5xx TEST LIVES. `markInternalOrigin` is called from the places that
+ * hold the real `Response` — `httpError`/`httpErrorMessage` and the timeout
+ * branch of `fetchWithTimeout` in `shared/src/http.ts` — so "is this an
+ * availability failure" is decided from the actual status code, never re-derived
+ * by scraping a number out of a sentence. A 404 from our own registry for a slug
+ * that does not exist is a caller's bad argument and is deliberately NOT marked.
+ */
+
+/**
+ * OUR OWN web service was unreachable — not an upstream, and never `upstream_down`.
+ *
+ * ONE value, not three, unlike `internal_db_*`. That split existed because a
+ * slow query, an exhausted pool and an unknown SQLSTATE have different owners
+ * and different fixes. Here there is only one story to tell — an origin we run
+ * did not answer the edge — and one owner. A bucket with no distinct owner per
+ * value is decoration; #724 is what happens when a class holds several
+ * situations, and inventing sub-values ahead of a reason to act on them
+ * differently is the same mistake with the sign flipped.
+ *
+ * METRICS ONLY, exactly like PLATFORM_KEY_ERROR_CLASS and the internal_db
+ * values. `classifyToolError` still answers `upstream_down` for the retry and
+ * hint paths, which only care whether retrying or a sibling tool might work —
+ * and it might. Nothing a caller sees or is charged changes here.
+ *
+ * READ SIDE: this value is in BROKEN_TOOL_CLASSES, FAULT_CLASSES and
+ * ALL_ERROR_CLASSES in `workers/registry-api/src/index.ts`. All three, or it
+ * lands on no dashboard — fleet #721 is the warning, where the #719 split
+ * worked on the write side and was invisible for weeks.
+ */
+const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
+
+/**
+ * The token that carries "this origin is ours" from the call site to the
+ * classifier.
+ *
+ * Appended to the error message rather than attached to the Error object,
+ * because the object does not survive the trip: 275 packs return `{ error:
+ * string }` instead of throwing, the gateway reads `observedError` as a string,
+ * and the fleet pack rebuilds its error from a captured status + body across a
+ * retry loop. A property on an Error would be dropped by every one of those
+ * paths and the class would work in tests and vanish in production.
+ *
+ * WORDING IS LOAD-BEARING, same rule as labelAge's note in authority.ts. This
+ * string is appended to a pack's thrown Error message (shared/src/http.ts),
+ * and a thrown Error's message is exactly what the gateway hands back to the
+ * caller as `content[0].text` when nothing rewrites it (workers/gateway/src
+ * catches the throw and sets `rawResult.message = stripClassPrefix(error)`,
+ * which does not touch this suffix) — so the original wording,
+ * " [pipeworx-hosted origin — our own service, not a third party]", was not a
+ * theoretical leak: it shipped live on pipeworx-catalog's 522s, 7 times in 6
+ * hours on 2026-09-02 (see tests/golden-internal-service.test.ts), verbatim
+ * naming Pipeworx as the host. check:hosting-claims never caught it because it
+ * did not scan shared/ at all (task #2009). Reworded to describe the
+ * OBSERVATION (the origin did not answer) without a claim about who runs it —
+ * the identical fix labelAge got: drop the possessive, keep the fact.
+ */
+const INTERNAL_ORIGIN_MARKER = ' [origin did not respond — retry before concluding the named source is down]';
+
+/**
+ * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
+ * exactly twenty lowercase letters (ours is `pqauisounztsgdgfkhke`).
+ *
+ * Matching the shape rather than listing the ref keeps this correct when we add
+ * a project — `supabaseEnv` on a pack entry already points some packs at a
+ * second one — while still excluding `status.supabase.co`, which is Supabase's
+ * own status page and emphatically not our database. Verified 2026-09-02 by
+ * `grep -rhoE '[a-z0-9-]+\.supabase\.(co|in)' mcps shared workers scripts`: the
+ * only real project ref anywhere in the tree is ours, the rest are doc
+ * placeholders (`abc`, `xyz`, `example`) which this pattern also excludes. Same
+ * finding internal-db-class.ts relies on for the PostgREST envelope being ours
+ * by construction.
+ */
+const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
+
+/**
+ * Is this a host WE run?
+ *
+ * Deliberately NOT including `*.workers.dev`: plenty of third-party APIs are
+ * hosted on workers.dev, so the suffix says where something runs and not who
+ * owns it. Every internal call we actually make goes to a `pipeworx.io`
+ * hostname or to our Supabase project, both of which are ownership facts.
+ *
+ * `workers/gateway/src/provenance.ts`'s `OUR_HOSTS` answers the same
+ * question and DOES include `workers.dev` — a documented divergence
+ * (task #2051), not a bug to converge. That list decides what a response may
+ * cite as a data SOURCE, where a false negative (citing our own worker as an
+ * external source) is the hosting-disclosure leak this whole file exists to
+ * prevent, so it errs broad. This one decides who gets BLAMED for a 5xx in
+ * outage metrics read by on-call, where a false positive (crediting our own
+ * infra with a third party's outage) hides the real failure, so it errs
+ * narrow. Same suffix, opposite direction, because they are never called for
+ * the same reason.
+ *
+ * Returns false on anything unparseable rather than throwing — this runs inside
+ * an error path, and an error path that can itself throw turns a diagnosable
+ * failure into a mystery.
+ */
+function isPipeworxOrigin(url: string | URL | undefined | null): boolean {
+  if (!url) return false;
+  let host: string;
+  try {
+    host = new URL(url instanceof URL ? url.href : url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === 'pipeworx.io' || host.endsWith('.pipeworx.io')) return true;
+  return SUPABASE_PROJECT_HOST.test(host);
+}
+
+/**
+ * Append the marker when this failure was OUR origin failing to answer.
+ *
+ * `status` is the HTTP status when there is one, and omitted for a timeout —
+ * where there is no response at all, and "the origin did not answer" is the
+ * whole observation. Statuses below 500 are left alone: a 404 from our own
+ * registry for a slug that does not exist is the caller's argument, not our
+ * outage, and marking it would put ordinary 404s on the incident dashboard.
+ *
+ * Idempotent, so a message that is wrapped and re-marked on the way up (the
+ * fleet pack's retry loop re-throws through two layers) carries the marker once.
+ */
+function markInternalOrigin(
+  message: string,
+  url: string | URL | undefined | null,
+  status?: number,
+): string {
+  if (status !== undefined && status < 500) return message;
+  if (!isPipeworxOrigin(url)) return message;
+  if (message.includes(INTERNAL_ORIGIN_MARKER)) return message;
+  return message + INTERNAL_ORIGIN_MARKER;
+}
+
+/**
+ * Which blob4 value a failure from our own web services books as, or undefined
+ * if this is not one.
+ *
+ * Ordered AFTER `internalDbMetricsClass` at the call site: a PostgREST envelope
+ * from our own Supabase is a strictly more specific statement about the same
+ * row (which of our services, and why), and the two cannot disagree about
+ * whether the failure is ours.
+ */
+function internalHostMetricsClass(error: string): string | undefined {
+  return error.includes(INTERNAL_ORIGIN_MARKER) ? INTERNAL_SERVICE_UNREACHABLE_CLASS : undefined;
+}
+
 
 /**
  * One place to turn a failed `fetch` into an error a caller can act on.
@@ -52,7 +253,21 @@ interface McpToolExport {
 
 /** Longest upstream explanation we'll pass through. Enough for a real message,
  *  short enough that an HTML page or a stack trace can't swamp the error. */
+
 const MAX_DETAIL = 300;
+
+/**
+ * Default bound for `fetchWithTimeout` when a pack doesn't state its own.
+ *
+ * 25s mirrors the number `epo-ops` landed on after measuring the real failure:
+ * a degraded upstream that doesn't error, it just never answers, and a Worker
+ * sits in `await fetch()` until ITS OWN execution budget kills the request —
+ * which can take minutes, not seconds (epo_ops_search_patents measured 4-8
+ * MINUTE hangs before this existed). 25s is short enough that a caller gets a
+ * fast, actionable error instead of holding the connection, and long enough
+ * that it doesn't false-trip on a merely-slow-but-alive upstream.
+ */
+const DEFAULT_FETCH_TIMEOUT_MS = 25_000;
 
 /**
  * Read the body of a failed response and fold it into a throwable Error.
@@ -67,13 +282,38 @@ const MAX_DETAIL = 300;
  * something new from inside the error path.
  */
 async function httpError(res: Response, name: string): Promise<Error> {
-  return new Error(`${name}: ${res.status}${detailSuffix(await readDetail(res))}`);
+  return new Error(await httpErrorMessage(res, name));
 }
 
 /** The message text without constructing an Error — for packs that need to wrap
  *  it in their own envelope or add an explicit classification prefix. */
 async function httpErrorMessage(res: Response, name: string): Promise<string> {
-  return `${name}: ${res.status}${detailSuffix(await readDetail(res))}`;
+  // The one place a 5xx from a host WE run gets stamped as ours. `res.url` is
+  // the URL the fetch actually resolved to (after redirects), so this is a fact
+  // about the call rather than a guess from the `name` the pack passed in —
+  // reword that label freely, the class does not move. See
+  // internal-host-class.ts; no-op for every third-party upstream, which is why
+  // this touches 481 packs' error text and changes none of it.
+  return markInternalOrigin(
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    res.url,
+    res.status,
+  );
+}
+
+/**
+ * Just the upstream's own explanation — no name, no status.
+ *
+ * For a pack that has already said both in its own sentence. epo-ops reads
+ * `EPO rejected this search as too large (HTTP 413) — ${httpErrorMessage(…)}`,
+ * which rendered as `… (HTTP 413) — EPO: 413.` once the XML detail was being
+ * dropped: the upstream named twice, the status twice, and the one thing EPO
+ * actually said ("Not enough characters before truncation character") nowhere
+ * (fleet #712). Returns '' when the body carries nothing readable, so a caller
+ * can fall back to its own wording.
+ */
+async function upstreamDetail(res: Response): Promise<string> {
+  return readDetail(res);
 }
 
 /**
@@ -131,10 +371,15 @@ async function parseJson<T>(res: Response, name: string): Promise<T> {
   // web page" — the second is diagnosable, the first is not.
   const head = raw.slice(0, 200).trimStart().toLowerCase();
   if (head.startsWith('<!doctype') || head.startsWith('<html') || head.startsWith('<?xml')) {
+    const kind = head.startsWith('<?xml') ? 'an XML document' : 'an HTML page';
+    // The summary, not the source. Pasting the first 120 characters of a web
+    // page handed the agent `<!DOCTYPE html><html lang="en"…` — the same leak
+    // this branch exists to describe (fleet #712).
     throw new Error(
-      `upstream_down: ${name} answered HTTP ${res.status} with an HTML page instead of JSON (${type}). ` +
+      `upstream_down: ${name} answered HTTP ${res.status} with ${kind} instead of JSON (${type}). ` +
         'That is typically a bot wall, a login redirect or a maintenance page — it is returned as a SUCCESS, ' +
-        `so status-code health checks read it as fine. No argument change will get past it. First 120 chars: ${collapse(raw).slice(0, 120)}`,
+        `so status-code health checks read it as fine. No argument change will get past it. ` +
+        `The page says: ${summarizeErrorBody(raw) || 'nothing readable'}`,
     );
   }
 
@@ -143,8 +388,71 @@ async function parseJson<T>(res: Response, name: string): Promise<T> {
   } catch {
     throw new Error(
       `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON (${type}). ` +
-        `First 120 chars: ${collapse(raw).slice(0, 120)}`,
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
     );
+  }
+}
+
+/**
+ * `fetch`, but bounded — the fix for a systemic gap found 2026-08-30: a grep
+ * audit of every pack's `mcps/*\/src/index.ts` found 1,339 of ~1,500 call
+ * `fetch()` with NO timeout guard anywhere in the file. Two of those
+ * (epo-ops, statcan) were confirmed live-hanging for 4-8 minutes before this
+ * existed — every unguarded call carries the same risk, just unconfirmed.
+ *
+ * Mirrors the `epoFetch` wrapper `mcps/epo-ops/src/index.ts` shipped first:
+ * bound the request with `AbortSignal.timeout`, and on a timeout/abort throw
+ * an `upstream_down:` error that names the upstream and the bound rather than
+ * letting the raw `TimeoutError`/`AbortError` (which names neither) propagate.
+ * `upstream_down:` is deliberate, same reasoning as `parseJson` above — no
+ * argument a caller passes can make an upstream hang, so it is always the
+ * upstream's fault, and marking it that way keeps a slow API off the
+ * problem-tools list where it would crowd out our own defects.
+ *
+ * Usage — a mechanical swap for a bare `fetch(url, init)`:
+ *
+ *     const res = await fetchWithTimeout(url, init, 'Some API');
+ *
+ * Pass `timeoutMs` as a fourth argument to override the default for a pack
+ * with a known-slower upstream; the label should be the same short name you'd
+ * pass to `httpError`/`httpErrorMessage` for that call.
+ */
+async function fetchWithTimeout(
+  url: string | URL,
+  init: RequestInit = {},
+  name: string,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (err) {
+    if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      // States the OBSERVATION (no response in N seconds), not a diagnosis.
+      // "appears to be degraded" is an inference about the vendor that we have
+      // not checked, and it is wrong in a way that misdirects whoever reads it:
+      // a timeout from a Worker can equally mean OUR egress is blocked.
+      //
+      // Measured today (2026-09-01, fleet #1047): every call to
+      // mainnet.base.org failed from the x402 facilitator while the identical
+      // request from a laptop returned 200. Base was entirely healthy; the
+      // public RPC refuses Cloudflare Worker egress. Had this message fired
+      // there it would have blamed Base by name, and the next person would have
+      // waited for a vendor outage to clear that did not exist.
+      // A timeout has no status to test — there is no response at all — so
+      // `markInternalOrigin` is called without one: an origin we run that never
+      // answered is an availability failure by definition. This is the half of
+      // fleet #1096 with neither a SQLSTATE nor a status code to key on.
+      throw new Error(
+        markInternalOrigin(
+          `upstream_down: ${name} did not respond within ${timeoutMs / 1000}s. ` +
+            `That can be ${name} being slow or down, or this environment being unable to reach it ` +
+            `(some hosts refuse datacenter/Worker egress) — retry shortly, and check reachability ` +
+            `from elsewhere before concluding ${name} is down.`,
+          url,
+        ),
+      );
+    }
+    throw err;
   }
 }
 
@@ -161,21 +469,114 @@ async function readDetail(res: Response): Promise<string> {
     // is still worth throwing — never let the error path throw its own error.
     return '';
   }
-  if (!raw) return '';
+  return summarizeErrorBody(raw);
+}
+
+/**
+ * Turn ANY error body — JSON, HTML, XML or plain text — into one short phrase
+ * that never contains markup.
+ *
+ * This used to just drop an HTML or XML body on the floor, on the reasoning
+ * that markup crowds out the status. That was half right. Dropping it loses the
+ * one sentence a caller could have acted on: an `Access Denied` title, an SDMX
+ * `<message:Error>` text, an OPS fault string. A 2026-08-30 support sweep
+ * measured 13 of 291 caller-facing error rows carrying a raw page or document
+ * verbatim, across 11 packs, and in every one of them the useful content —
+ * "Access Denied", "Invalid country code", "SCRAPE_TIMEOUT" — was in there,
+ * buried in markup the agent had to parse out of a string (fleet #712).
+ *
+ * So: extract the meaning, discard the markup. The output is passed through
+ * `stripMarkup` unconditionally, which is what lets `check:error-body-leak`
+ * assert mechanically that no caller-facing message can contain `<?xml`,
+ * `<!DOCTYPE` or `<html`.
+ */
+function summarizeErrorBody(raw: string): string {
+  if (!raw || !raw.trim()) return '';
+
+  const head = raw.slice(0, 400).trimStart().toLowerCase();
 
   // An HTML error page (Cloudflare interstitial, nginx default, a login
-  // redirect) carries no API-level explanation, only markup that would crowd out
-  // the status. Recognising it is worth more than stripping it: dropping it
-  // keeps the message honest instead of filling it with `<!DOCTYPE html><html>`.
-  const head = raw.slice(0, 200).trimStart().toLowerCase();
-  if (head.startsWith('<!doctype html') || head.startsWith('<html') || head.startsWith('<?xml')) return '';
+  // redirect) says what it is in its <title>, and almost nowhere else.
+  if (head.startsWith('<!doctype') || head.startsWith('<html')) {
+    const title = htmlTitle(raw);
+    return title
+      ? `${title} (upstream returned an HTML error page, not an API response)`
+      : 'upstream returned an HTML error page, not an API response';
+  }
+
+  // XML fault documents — EPO OPS, SDMX (`<message:Error>`), SOAP faults. The
+  // human sentence sits in a child element whose tag name says what it is.
+  if (head.startsWith('<?xml') || head.startsWith('<')) {
+    const fault = xmlFaultText(raw);
+    return fault
+      ? `${stripMarkup(fault).slice(0, MAX_DETAIL)} (from the upstream's XML error document)`
+      : 'upstream returned an XML error document with no readable message';
+  }
 
   // Most JSON error bodies bury one human sentence among ids and echoed request
   // params. Prefer that sentence; fall back to the whole body when the shape is
   // unfamiliar, since an unfamiliar shape is exactly when we can least afford to
   // guess wrong and show nothing.
   const fromJson = messageFromJson(raw);
-  return collapse(fromJson ?? raw).slice(0, MAX_DETAIL);
+  return stripMarkup(fromJson ?? raw).slice(0, MAX_DETAIL);
+}
+
+/** The `<title>` of an HTML error page, or its first `<h1>` — the two places a
+ *  bot wall, a 502 and an "Access Denied" all state what happened. */
+function htmlTitle(raw: string): string | null {
+  const head = raw.slice(0, 4000);
+  for (const re of [/<title[^>]*>([\s\S]*?)<\/title>/i, /<h1[^>]*>([\s\S]*?)<\/h1>/i]) {
+    const m = re.exec(head);
+    const text = m ? stripMarkup(m[1]) : '';
+    if (text) return text.slice(0, 160);
+  }
+  return null;
+}
+
+/** Tag names that carry the explanation in an XML fault document, namespace
+ *  prefix optional (`<message:Error>`, `<com:Text>`, `<faultstring>`). */
+const XML_FAULT_TAG_RE =
+  /<(?:[A-Za-z0-9_.-]+:)?(?:text|message|description|faultstring|reason|detail|title|errormessage|error)\b[^>]*>([^<]{2,400})</i;
+
+function xmlFaultText(raw: string): string | null {
+  const head = raw.slice(0, 8000);
+  const tagged = XML_FAULT_TAG_RE.exec(head);
+  if (tagged && tagged[1].trim()) return tagged[1];
+
+  // Nothing conventionally named — take the longest text node instead. A fault
+  // document with one sentence in an oddly named element is still readable;
+  // returning nothing at all is not.
+  let best = '';
+  for (const m of head.matchAll(/>([^<>]{8,400})</g)) {
+    const text = m[1].trim();
+    if (text.length > best.length) best = text;
+  }
+  return best || null;
+}
+
+/**
+ * Remove every tag and stray angle bracket, then collapse whitespace.
+ *
+ * Applied to everything on the way out, including the JSON and plain-text
+ * paths, because an upstream is free to embed markup in a JSON string field —
+ * and a leak is a leak regardless of which branch produced it.
+ */
+function stripMarkup(s: string): string {
+  return collapse(decodeEntities(s.replace(/<[^>]*>/g, ' ')).replace(/[<>]/g, ' '));
+}
+
+/** The handful of entities that show up in error-page titles. Decoded AFTER
+ *  tags are stripped and BEFORE the angle-bracket sweep, so `&lt;script&gt;`
+ *  in a title cannot decode into markup that survives — EMBL-EBI's ChEMBL 500
+ *  page renders as `500 Internal Server Error &lt; EMBL-EBI` otherwise. */
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&(?:amp|#0*38);/gi, '&')
+    .replace(/&(?:lt|#0*60);/gi, '<')
+    .replace(/&(?:gt|#0*62);/gi, '>')
+    .replace(/&(?:quot|#0*34);/gi, '"')
+    .replace(/&(?:#0*39|apos|#x0*27);/gi, "'")
+    .replace(/&nbsp;/gi, ' ');
 }
 
 /** The conventional "what went wrong" field, under any of the names upstreams
@@ -234,9 +635,16 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
-
-
 /** Medicare national and local coverage policy from the official CMS Coverage API. */
+
+// Bound every fetch() in this pack to a fixed timeout — an upstream that
+// degrades without erroring would otherwise hold the Worker in `await fetch()`
+// until its own execution budget kills the request (minutes, not seconds).
+// Mirrors the epoFetch / usaspending retryFetch pattern (fleet #685).
+async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response> {
+  return fetchWithTimeout(url, init ?? {}, 'Medicare Coverage');
+}
+
 
 const BASE = 'https://api.coverage.cms.gov/v1';
 const CMS_DATA = 'https://data.cms.gov/data-api/v1';
@@ -253,7 +661,7 @@ const listSchema = (key: string) => ({
 const tools: McpToolExport['tools'] = [
   {
     name: 'medicare_ncd_search',
-    description: 'Search current Medicare National Coverage Determinations (NCDs) by title, benefit category, or NCD number. NCDs describe national Medicare policy; they are not individualized coverage guarantees or medical advice.',
+    description: 'ANSWERS "does Medicare cover X" / "is X covered by Medicare" / "what is Medicare\'s coverage policy for X" — searches current Medicare National Coverage Determinations (NCDs), the national policy documents that say whether Medicare covers a drug, device, procedure or therapy. Search by everyday product or therapy name ("CAR T-cell", "amyloid PET", "insulin pump"), by title, benefit category, or NCD number. NCDs describe national Medicare policy; they are not individualized coverage guarantees or medical advice.',
     inputSchema: { type: 'object', properties: {
       query: { type: 'string', description: 'Title/topic text or NCD number, e.g. "amyloid" or "220.6.20". Terms are matched against CMS\'s formal titles, which spell acronyms out — search "positron tomography", not "PET".' },
       limit: { type: 'number', description: 'Results (1-100, default 25).' },
@@ -277,11 +685,11 @@ const tools: McpToolExport['tools'] = [
     name: 'medicare_lcd_search',
     description: 'Search current final Medicare Local Coverage Determinations (LCDs), optionally restricted to a state. LCDs are contractor- and jurisdiction-specific and can differ across locations.',
     inputSchema: { type: 'object', properties: {
-      query: { type: 'string', description: 'Policy title/topic or LCD number.' },
+      query: { type: 'string', description: 'Policy title/topic or LCD number. Omit to browse the most recently updated LCDs — that is the answer to "what changed recently".' },
       state: { type: 'string', description: 'Optional US state name or two-letter abbreviation. California, New York and Missouri span multiple MAC jurisdictions; those resolve to the whole-state jurisdiction and the response reports which one under state_resolved.' },
       status: { type: 'string', description: 'Optional CMS status filter.' },
       limit: { type: 'number', description: 'Results (1-100, default 25).' },
-    }, required: ['query'] },
+    }, required: [] },
     outputSchema: listSchema('documents'),
   },
   {
@@ -415,7 +823,7 @@ const tools: McpToolExport['tools'] = [
   },
   {
     name: 'medicare_product_market_profile',
-    description: 'Combine national coverage-policy matches with annual Medicare fee-for-service utilization for a product/topic and caller-supplied HCPCS codes. CMS does not validate the product-to-code association; verify coding and policy details independently.',
+    description: 'UTILIZATION ANALYTICS for a product whose HCPCS billing codes you ALREADY KNOW: requires 1-5 caller-supplied HCPCS codes and combines their annual Medicare fee-for-service claim volumes and payments with matching coverage-policy documents. Use when you have the codes and want spend, volume and trend. For a plain coverage question with no codes in hand, medicare_ncd_search answers it directly. CMS does not validate the product-to-code association; verify coding and policy details independently.',
     inputSchema: { type: 'object', properties: {
       query: { type: 'string', description: 'Product, technology, or clinical topic.' },
       hcpcs_codes: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 5 },
@@ -425,6 +833,15 @@ const tools: McpToolExport['tools'] = [
       query: { type: 'string' }, hcpcs_codes: { type: 'array', items: { type: 'object' } },
       national_policy: { type: 'object' }, interpretation: { type: 'string' },
     }, required: ['query', 'hcpcs_codes', 'national_policy', 'interpretation'] },
+  },
+  {
+    name: 'medicare_part_d_top_drugs',
+    description: 'Rank Medicare Part D drugs by total gross spending for a year — the biggest drugs in the Part D program, highest first. Answers "which drugs have the highest Medicare Part D spending", "top Part D drugs by cost", "what does Medicare spend the most on". Returns brand name, generic name and total spending. Spending is gross, before confidential manufacturer rebates.',
+    inputSchema: { type: 'object', properties: {
+      year: { type: 'string', description: 'Spending year, e.g. "2023". Defaults to the newest year the dataset carries.' },
+      limit: { type: 'number', description: 'How many drugs to return (1-100, default 20).' },
+    } },
+    outputSchema: listSchema('drugs'),
   },
   {
     name: 'medicare_part_d_drug_spending',
@@ -439,9 +856,19 @@ const tools: McpToolExport['tools'] = [
     name: 'medicare_part_d_prescriber_exposure',
     description: 'Return a bounded sample of Medicare Part D prescriber-by-drug rows for an exact brand name in one year, optionally filtered by state, with the authoritative matching-row count. This is not a prescriber ranking and suppressed/non-Part-D activity is absent.',
     inputSchema: { type: 'object', properties: {
-      brand_name: { type: 'string' }, state: { type: 'string' }, year: { type: 'number' },
+      brand_name: { type: 'string', description: 'Exact Part D brand name, e.g. "Eliquis". `drug` is accepted as a synonym.' },
+      drug: { type: 'string', description: 'Synonym for brand_name — the sibling spending tool spells it this way.' },
+      state: { type: 'string' }, year: { type: 'number' },
       limit: { type: 'number' }, offset: { type: 'number' },
-    }, required: ['brand_name'] },
+    // `brand_name` is deliberately NOT in `required`, and putting it back
+    // re-breaks the question this tool exists for. Its sibling
+    // medicare_part_d_drug_spending spells the same value `drug`, so a router
+    // that just answered "how much did Part D spend on Eliquis" carries `drug`
+    // into "how many prescribers wrote for Eliquis" — and the gateway rejects
+    // a declared-required arg BEFORE the pack runs, so the synonym below can
+    // never rescue it from behind `required`. Same trap as otx (81597643) and
+    // pubmed's pmid/id (8443d463). The handler validates and names both.
+    } },
     outputSchema: { type: 'object', properties: {
       brand_name: { type: 'string' }, year: { type: 'number' }, matching_rows: { type: 'number' },
       returned: { type: 'number' }, prescribers: { type: 'array', items: { type: 'object' } },
@@ -562,6 +989,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     case 'medicare_hcpcs_geography': return hcpcsGeography(args);
     case 'medicare_provider_exposure': return providerExposure(args);
     case 'medicare_product_market_profile': return productMarketProfile(args);
+    case 'medicare_part_d_top_drugs': return partDTopDrugs(args);
     case 'medicare_part_d_drug_spending': return partDDrugSpending(args);
     case 'medicare_part_d_prescriber_exposure': return partDPrescriberExposure(args);
     case 'medicare_part_d_generic_competition': return partDGenericCompetition(args);
@@ -577,12 +1005,134 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   }
 }
 
+// CMS titles punctuate differently from the way anyone types a therapy name.
+// The CAR-T NCD is titled "Chimeric Antigen Receptor (CAR) T-cell Therapy", so
+// a plain substring match on "car-t" — the spelling every clinician, analyst
+// and press release uses — finds NOTHING, while "CAR T-cell" finds it. Measured
+// live 2026-08-11: query "CAR-T" -> 0 documents, "CAR T-cell" -> 1.
+//
+// Zero documents on a COVERAGE question is not a harmless miss. It reads as
+// "Medicare does not cover this", and Medicare does cover CAR-T. That is a
+// silent wrong answer to a market-access analyst, which is worse than the
+// argument error this question used to produce (fleet #253).
+//
+// So: keep the exact substring pass as the primary (nothing that matches today
+// stops matching), and add a separator-flexible fallback ONLY when it finds
+// nothing. The fallback lets any run of non-alphanumerics in the query match
+// any run in the title — "car-t" then matches "(CAR) T-cell".
+//
+// The boundary guards are the whole reason this is safe. Without the trailing
+// (?![a-z0-9]), "car-t" collapses to "cart" and matches CARTILAGE — the same
+// open-tail trap that sent "bandwidth" questions to a music pack in fleet #219.
+// Anchored on both sides, "cart" is rejected inside "cartilage" and accepted in
+// "(car) t-cell".
+function separatorFlexibleMatcher(query: string): RegExp | null {
+  const tokens = query.split(/[^a-z0-9]+/).filter(Boolean);
+  // A single token has no separator to be flexible about; the primary pass
+  // already covered it, and loosening one token only invites false matches.
+  if (tokens.length < 2) return null;
+  const esc = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // The separator run must be NON-EMPTY. Writing "car-t" asserts a boundary
+  // between "car" and "t", so the title must have one too — otherwise the
+  // tokens collapse and "car-t" matches "shopping CART analysis". My own test
+  // caught that: with `*` it did.
+  //
+  // Optional plural on the FINAL token only, because CMS titles pluralise
+  // ("external insulin pumpS") and a hyphenated query would otherwise miss
+  // them — the fallback would be stricter than the substring pass it exists to
+  // rescue, which defeats the point.
+  return new RegExp(`(?<![a-z0-9])${tokens.map(esc).join('[^a-z0-9]+')}(?:e?s)?(?![a-z0-9])`);
+}
+
 async function searchNcd(args: Record<string, unknown>) {
   const query = requiredString(args, 'query').toLowerCase();
+  const fields = ['title', 'document_display_id', 'chapter', 'document_type'];
   const payload = await cms('/reports/national-coverage-ncd/');
-  const all = rows(payload).filter((row) => includesAny(row, query,
-    ['title', 'document_display_id', 'chapter', 'document_type']));
-  return listResult('documents', all.slice(0, limitArg(args)), all.length, nationalInterpretation());
+  const every = rows(payload);
+  let all = every.filter((row) => includesAny(row, query, fields));
+  let matchedBy: string | undefined;
+  if (all.length === 0) {
+    const re = separatorFlexibleMatcher(query);
+    if (re) {
+      all = every.filter((row) => fields.some((f) => re.test(String(row[f] ?? '').toLowerCase())));
+      // Say so when the fallback did the work. A caller who searched "CAR-T"
+      // and got the "(CAR) T-cell" NCD should be able to see that the match
+      // survived a punctuation difference rather than wonder why the title
+      // looks unlike what they asked for.
+      if (all.length > 0) matchedBy = 'separator_flexible';
+    }
+  }
+  // Phrase matching cannot reach a controlled vocabulary. There are only 345
+  // NCDs and they are titled in CMS's words, not the caller's: "continuous
+  // glucose monitors" returned NOTHING while the policy sits there as "Home
+  // Blood Glucose Monitors" (40.2), alongside "Closed-Loop Blood Glucose
+  // Control Device" (40.3) and "Blood Glucose Testing" (190.20). Answering
+  // zero to that question says Medicare has no such policy, which is false.
+  if (all.length === 0) {
+    const terms = ncdTerms(query);
+    if (terms.length > 1) {
+      all = every.filter((row) => {
+        const hay = fields.map((f) => String(row[f] ?? '')).join(' ').toLowerCase();
+        return terms.every((t) => hay.includes(t));
+      });
+      if (all.length > 0) matchedBy = 'all_terms';
+    }
+  }
+  // Still nothing. With a vocabulary this small the useful answer is the
+  // nearest titles, not an empty list — the caller cannot guess CMS's phrasing
+  // and has no other way to discover it.
+  if (all.length === 0) {
+    const terms = ncdTerms(query);
+    const scored = every
+      .map((row) => {
+        const hay = fields.map((f) => String(row[f] ?? '')).join(' ').toLowerCase();
+        return { row, score: terms.filter((t) => hay.includes(t)).length };
+      })
+      .filter((s) => s.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+    return {
+      total: 0,
+      returned: 0,
+      documents: [],
+      source: source(),
+      interpretation: nationalInterpretation(),
+      ...(scored.length
+        ? {
+            did_you_mean: scored.map((s) => ({
+              title: s.row.title,
+              document_display_id: s.row.document_display_id,
+            })),
+            hint: `No NCD title contains "${query}". CMS titles these in its own words — the closest are listed in did_you_mean; search one of those titles, or use medicare_lcd_search, since many devices are covered by LOCAL policy with no national determination at all.`,
+          }
+        : {
+            hint: `No NCD matches "${query}". There are only ${every.length} national coverage determinations in total; most coverage detail lives in LOCAL policy — try medicare_lcd_search.`,
+          }),
+    };
+  }
+  // Every zero-result path returns above (did_you_mean / hint), so anything
+  // reaching here matched something.
+  const result = listResult('documents', all.slice(0, limitArg(args)), all.length, nationalInterpretation());
+  return matchedBy ? { ...result, matched_by: matchedBy } : result;
+}
+
+/** Significant words for matching against CMS's own titles. "continuous" is
+ *  kept — it is meaningful here — but articles and the words every policy title
+ *  contains would match everything. */
+const NCD_STOPWORDS = new Set(['the', 'a', 'an', 'of', 'for', 'and', 'or', 'in', 'on', 'to', 'with', 'is', 'are', 'medicare', 'coverage', 'determination', 'ncd', 'policy']);
+
+function ncdTerms(query: string): string[] {
+  return [
+    ...new Set(
+      query
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((t) => t.length > 2 && !NCD_STOPWORDS.has(t))
+        // "monitors" should reach "Monitor"; crude, and right far more often
+        // than it is wrong on a 345-item vocabulary.
+        .map((t) => (t.endsWith('s') && t.length > 4 ? t.slice(0, -1) : t)),
+    ),
+  ];
 }
 
 async function ncdDetail(args: Record<string, unknown>) {
@@ -604,14 +1154,23 @@ async function ncdDetail(args: Record<string, unknown>) {
 }
 
 async function searchLcd(args: Record<string, unknown>) {
-  const query = requiredString(args, 'query').toLowerCase();
+  // `query` used to be required, so "what are the recent changes to Medicare
+  // local coverage determinations?" — a question with no topic in it — came
+  // back "query is required". An argument error is not an answer, and the
+  // caller cannot invent a topic they did not ask about. With no query this now
+  // browses: every LCD for the state (or all states), newest first, which IS
+  // the answer to "what's recent".
+  const query = stringArg(args.query)?.toLowerCase() ?? '';
   const state = stringArg(args.state);
   const resolved = state ? await resolveState(state) : null;
   const payload = await cms('/reports/local-coverage-final-lcds/', compact({
     state_id: resolved?.id, status: stringArg(args.status),
   }));
-  const all = rows(payload).filter((row) =>
-    includesAny(row, query, ['title', 'document_display_id', 'contractor_name_type']));
+  const every = rows(payload);
+  const all = query
+    ? every.filter((row) => includesAny(row, query, ['title', 'document_display_id', 'contractor_name_type']))
+    : [...every].sort((a, b) =>
+        String(b.last_updated_sort ?? b.last_updated ?? '').localeCompare(String(a.last_updated_sort ?? a.last_updated ?? '')));
   return {
     ...listResult('documents', all.slice(0, limitArg(args)), all.length, localInterpretation()),
     // Say which CMS jurisdiction the request actually landed in — asking for
@@ -923,6 +1482,44 @@ function stringOrNull(value: unknown): string | null {
   return text || null;
 }
 
+// Does this HCPCS code appear in the utilization data for ANY year?
+//
+// Needed because a code that does not exist and a real code with no activity in
+// the requested year are IDENTICAL in a single year's response: both give zero
+// rows and a null description. Measured live before writing this:
+//   99999 (not a code)      -> 0 services / null description in every year
+//   G2211 (real, new 2024)  -> 0 services / null description 2020-2023, 24.9M in 2024
+//   U0003 (real, retired)   -> data 2020-2023, 0 services / null description in 2024
+// So `hcpcs_description === null` is a signal about the YEAR, not about the
+// code, and using it as a code-validity test would have called G2211 fake for
+// four years running. Only "absent from EVERY year" distinguishes them.
+//
+// Sequential with an early exit, and only ever reached on a zero result, so the
+// normal path costs nothing and the worst case is one cheap request per year.
+async function hcpcsCodeExistsInAnyYear(
+  code: string,
+  distributions: { year: number; url: string }[],
+): Promise<boolean> {
+  for (const d of distributions) {
+    const probe = await cmsDataRows(d.url, { HCPCS_Cd: code }, 1);
+    if (probe.length > 0) return true;
+  }
+  return false;
+}
+
+function unknownHcpcsError(code: string, years: number[]): Error {
+  const span = years.length ? `${Math.min(...years)}-${Math.max(...years)}` : 'the published years';
+  // user_error: a code that was mistyped, deprecated, or borrowed from another
+  // coding system is a caller mistake. Without the prefix every wrong code
+  // books as a medicare outage on the Problem Tools list.
+  return new Error(
+    `user_error: HCPCS code "${code}" does not appear anywhere in CMS Medicare utilization data for `
+    + `${span}, so there is no spending to report for it — this is NOT a finding that Medicare paid `
+    + 'nothing. Check the code: it may be mistyped, may be from a different code set (ICD, NDC, CPT '
+    + 'Category II), or may never have been billed to Medicare fee-for-service.',
+  );
+}
+
 async function hcpcsTrend(args: Record<string, unknown>) {
   const code = hcpcsArg(args.hcpcs_code);
   const distributions = await utilizationDistributions('geography');
@@ -933,6 +1530,13 @@ async function hcpcsTrend(args: Record<string, unknown>) {
     const national = data.filter((row) => row.Rndrng_Prvdr_Geo_Lvl === 'National');
     return summarizeUtilizationYear(distribution.year, national, distribution);
   }));
+  // The trend already queried every year in range, so "nothing anywhere" is
+  // established without a single extra request. A real code always has at least
+  // one year with a description — that is exactly what separates G2211 from
+  // 99999, and it is free here.
+  if (years.length > 0 && years.every((y) => !y.hcpcs_description && !y.total_services)) {
+    throw unknownHcpcsError(code, selected.map((d) => d.year));
+  }
   return {
     hcpcs_code: code, years, source: utilizationSource(),
     interpretation: utilizationInterpretation(),
@@ -945,6 +1549,13 @@ async function hcpcsGeography(args: Record<string, unknown>) {
   const year = selectedYear(args.year, distributions);
   const distribution = distributions.find((d) => d.year === year)!;
   const all = await cmsDataRows(distribution.url, { HCPCS_Cd: code }, 200);
+  // Single-year tool, so an empty result is ambiguous in a way the trend's is
+  // not: it could be a code that does not exist, or a real code with no billed
+  // activity in THIS year (G2211 before 2024). Only ask the other years when
+  // there is nothing to report, and let a real-but-idle code answer zero.
+  if (all.length === 0 && !(await hcpcsCodeExistsInAnyYear(code, distributions))) {
+    throw unknownHcpcsError(code, distributions.map((d) => d.year));
+  }
   const geographies = all.filter((row) => row.Rndrng_Prvdr_Geo_Lvl === 'State')
     .slice(0, intArg(args.limit, 120, 1, 120)).map(projectGeography);
   return {
@@ -971,6 +1582,12 @@ async function providerExposure(args: Record<string, unknown>) {
     cmsDataRows(distribution.url, filters, limit, offset),
     cmsDataStats(distribution.url, filters),
   ]);
+  // Same ambiguity as geography. Note the existence probe deliberately drops
+  // any state filter — a code billed nowhere in Texas is still a real code, and
+  // probing with the state attached would call it fake.
+  if (stats.found_rows === 0 && !(await hcpcsCodeExistsInAnyYear(code, distributions))) {
+    throw unknownHcpcsError(code, distributions.map((d) => d.year));
+  }
   return {
     hcpcs_code: code, year, state: state ?? null,
     matching_rows: stats.found_rows, returned: providers.length,
@@ -1020,6 +1637,96 @@ const POST_ACUTE_TITLES = {
   'Skilled Nursing': 'Medicare Post-Acute Care Utilization - Skilled Nursing Facility by Geography and Provider',
 } as const;
 
+/**
+ * Rank Part D drugs by total spending.
+ *
+ * "Which drugs have the highest Medicare Part D spending?" answered `no_match`
+ * because every Part D tool required a specific drug — you had to already know
+ * the answer to ask the question. It is the market-access analyst's opening
+ * question, so that gap mattered more than its one line of demand suggests.
+ *
+ * CMS makes this awkward in a way worth writing down: **the data API silently
+ * ignores `sort`.** `sort=-Tot_Spndng_2023` returns 200 and hands back Zyprexa
+ * first, which is nowhere near the top spender — the parameter is accepted and
+ * discarded, exactly the class of failure that looks like an answer. So the
+ * ranking has to happen here.
+ *
+ * A full scan is affordable ONLY because of column projection: the dataset is
+ * 14,536 rows and ~21MB whole, but `column=Brnd_Name,Gnrc_Name,Tot_Spndng_<yr>`
+ * (comma-separated — repeated `column=` params silently keep just the last)
+ * is ~470KB across 3 pages of 5,000. That is the difference between feasible
+ * and not.
+ */
+async function partDTopDrugs(args: Record<string, unknown>) {
+  const distribution = (await catalogDistributions(PART_D_SPENDING_TITLE)).at(-1)!;
+  const limit = intArg(args.limit, 20, 1, 100);
+
+  // The dataset carries one spending column per year; use the newest the
+  // distribution actually exposes rather than a hardcoded year that goes stale.
+  const probe = await cmsDataRows(distribution.url, {}, 1, 0);
+  const years = Object.keys(probe[0] ?? {})
+    .map((k) => /^Tot_Spndng_(\d{4})$/.exec(k)?.[1])
+    .filter((y): y is string => Boolean(y))
+    .sort();
+  const year = stringArg(args.year) ?? years.at(-1);
+  if (!year || !years.includes(year)) {
+    throw new Error(
+      `user_error: no spending column for year ${stringArg(args.year) ?? '(none)'}. This dataset covers ${years.join(', ')}.`,
+    );
+  }
+  const spendField = `Tot_Spndng_${year}`;
+
+  const PAGE = 5000;
+  const rowsOut: Array<Record<string, unknown>> = [];
+  for (let offset = 0; offset < 20_000; offset += PAGE) {
+    const url = new URL(distribution.url);
+    url.searchParams.set('size', String(PAGE));
+    url.searchParams.set('offset', String(offset));
+    // Mftr_Name is projected for one reason: CMS publishes a row PER
+    // MANUFACTURER plus an aggregate "Overall" row for the same drug, so a
+    // naive rank lists Eliquis twice at $20.77B and calls it the top two.
+    url.searchParams.set('column', `Brnd_Name,Gnrc_Name,Mftr_Name,${spendField}`);
+    const res = await pwFetch(url.toString(), { headers: { Accept: 'application/json' } });
+    if (!res.ok) throw new Error(`CMS Part D spending page failed (${res.status})`);
+    const page = (await res.json()) as Array<Record<string, unknown>>;
+    rowsOut.push(...page);
+    if (page.length < PAGE) break;
+  }
+
+  const ranked = rowsOut
+    .filter((row) => String(row.Mftr_Name ?? '') === 'Overall')
+    .map((row) => ({
+      brand_name: row.Brnd_Name,
+      generic_name: row.Gnrc_Name,
+      total_spending: numberValue(row[spendField]),
+    }))
+    .filter((r) => r.total_spending > 0)
+    .sort((a, b) => b.total_spending - a.total_spending)
+    .slice(0, limit);
+
+  return {
+    year: Number(year),
+    // Every other tool in this pack answers with the shared {total, returned}
+    // envelope from listSchema(), and this one called the same number
+    // `scanned_rows` instead — so it declared listSchema('drugs') and then
+    // failed it, which is what reddened the nightly full-catalog schema check
+    // (the sole mismatch out of 2,669 tools carrying an outputSchema).
+    // `total` here means what it means everywhere else in the pack: the
+    // population the answer was drawn from, i.e. every Part D row CMS publishes
+    // for that year, of which `returned` are ranked back.
+    // `scanned_rows` stays for anyone already reading it — adding a field is
+    // safe, removing one is not.
+    total: rowsOut.length,
+    scanned_rows: rowsOut.length,
+    returned: ranked.length,
+    drugs: ranked,
+    dataset: distribution,
+    source: partDSource(),
+    interpretation:
+      `${partDInterpretation()} Ranked across all ${rowsOut.length} rows CMS publishes for ${year}, sorted here because the CMS data API accepts a sort parameter and ignores it. Spending is gross Part D spending before manufacturer rebates, which are confidential — so this is not net cost to Medicare.`,
+  };
+}
+
 async function partDDrugSpending(args: Record<string, unknown>) {
   const drug = requiredString(args, 'drug');
   const distribution = (await catalogDistributions(PART_D_SPENDING_TITLE)).at(-1)!;
@@ -1047,6 +1754,10 @@ async function partDDrugSpending(args: Record<string, unknown>) {
 }
 
 async function partDPrescriberExposure(args: Record<string, unknown>) {
+  // Accept the sibling tool's spelling before demanding this one's.
+  if (args.brand_name == null && typeof args.drug === 'string' && args.drug.trim()) {
+    args = { ...args, brand_name: args.drug };
+  }
   const brandName = requiredString(args, 'brand_name');
   const distributions = await catalogDistributions(PART_D_PRESCRIBER_TITLE);
   const year = selectedYear(args.year, distributions);
@@ -1299,8 +2010,22 @@ async function utilizationDistributions(kind: 'geography' | 'provider'): Promise
 }
 
 async function catalogDistributions(title: string): Promise<CmsDistribution[]> {
-  const response = await fetch(CMS_CATALOG, { headers: { Accept: 'application/json' } });
-  const payload = await boundedJson(response, 'CMS data catalog', 3_000_000) as { dataset?: CatalogDataset[] };
+  const response = await pwFetch(CMS_CATALOG, { headers: { Accept: 'application/json' } });
+  // CMS's DCAT catalog crossed 3 MB and took four tools down with it.
+  //
+  // On 2026-08-11 data.cms.gov/data.json measured 3,002,727 bytes against a
+  // 3,000,000 cap — over by 2,727 bytes, 0.09% — and every tool that resolves a
+  // dataset through the catalog answered "CMS data catalog exceeded size limit".
+  // That is Part D drug spending, Part D prescribers, Medicare enrollment and
+  // the utilization tools: the reimbursement questions a market-access analyst
+  // opens with.
+  //
+  // A cap sized just above today's payload is a time bomb on any upstream that
+  // grows monotonically, which a government data catalog does. 32 MB is roughly
+  // 10x current and still far under the Worker's memory ceiling, so the guard
+  // keeps doing its real job (refusing a runaway or an HTML error page) without
+  // re-breaking the day CMS publishes another few datasets.
+  const payload = await boundedJson(response, 'CMS data catalog', 32_000_000) as { dataset?: CatalogDataset[] };
   const dataset = (payload.dataset ?? []).find((row) => row.title === title);
   if (!dataset) throw new Error(`CMS catalog did not contain ${title}.`);
   const byYear = new Map<number, CmsDistribution>();
@@ -1325,7 +2050,7 @@ async function cmsDataRows(urlValue: string, filters: Record<string, string>, si
   if (offset) url.searchParams.set('offset', String(offset));
   if (keyword) url.searchParams.set('keyword', keyword);
   for (const [column, value] of Object.entries(filters)) url.searchParams.set(`filter[${column}]`, value);
-  const payload = await boundedJson(await fetch(url, { headers: { Accept: 'application/json' } }),
+  const payload = await boundedJson(await pwFetch(url, { headers: { Accept: 'application/json' } }),
     'CMS utilization query', 4_000_000);
   if (!Array.isArray(payload)) throw new Error('CMS utilization query returned a non-array response.');
   return payload.filter((row): row is Record<string, unknown> =>
@@ -1336,7 +2061,7 @@ async function cmsDataStats(urlValue: string, filters: Record<string, string>, k
   const url = new URL(`${urlValue.replace(/\/$/, '')}/stats`);
   if (keyword) url.searchParams.set('keyword', keyword);
   for (const [column, value] of Object.entries(filters)) url.searchParams.set(`filter[${column}]`, value);
-  const payload = await boundedJson(await fetch(url, { headers: { Accept: 'application/json' } }),
+  const payload = await boundedJson(await pwFetch(url, { headers: { Accept: 'application/json' } }),
     'CMS utilization statistics', 100_000) as Record<string, unknown>;
   return {
     found_rows: numberValue(payload.found_rows),
@@ -1552,7 +2277,7 @@ async function cms(path: string, params: Record<string, unknown> = {}, token?: s
   }
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (token) headers.Authorization = `Bearer ${token}`;
-  const response = await fetch(url, { headers });
+  const response = await pwFetch(url, { headers });
   if (response.status === 401 || response.status === 403) {
     throw new Error('CMS Coverage rejected the license token. Obtain a fresh token directly from the CMS license-agreement endpoint after accepting its terms.');
   }

@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/medicare-coverage",
   "title": "Medicare Coverage",
   "description": "MCP server for medicare-coverage",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "websiteUrl": "https://pipeworx.io/packs/medicare-coverage",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-medicare-coverage",

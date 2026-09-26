@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-medicare-coverage",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "MCP server for medicare-coverage",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-4461697b067d1fbe47943925d905c894331973aff0678efe5cd7f033a59bc1aa",
-    "sourceCommit": "adb69d997f82a62e8e22b594488c7d04a227db35"
+    "sourceHash": "v1-68fc16075f758827e2db81fbcdc5afc01d3c982346dd56e6cf143b2f1b87d183",
+    "sourceCommit": "6182c4cfebddb94950e060b5d2fca18f18ad1aca"
   }
 }

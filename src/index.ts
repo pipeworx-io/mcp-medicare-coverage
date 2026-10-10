@@ -2030,7 +2030,11 @@ interface CatalogDistribution {
   format?: string;
   description?: string;
   accessURL?: string;
-  temporal?: string;
+  // Was a plain ISO-8601-interval STRING until CMS's 2026-09-29 catalog
+  // restructuring (fleet #2922); it is now an array of DCAT PeriodOfTime
+  // objects. Both shapes are handled below (see distributionYear) rather than
+  // assuming the new one is permanent.
+  temporal?: string | Array<{ startDate?: string; endDate?: string }>;
   modified?: string;
 }
 interface CatalogDataset {
@@ -2042,6 +2046,56 @@ async function utilizationDistributions(kind: 'geography' | 'provider'): Promise
   return catalogDistributions(kind === 'geography'
     ? 'Medicare Physician & Other Practitioners - by Geography and Service'
     : 'Medicare Physician & Other Practitioners - by Provider and Service');
+}
+
+// CMS's DCAT catalog restructured ~2026-09-29 (fleet #2922): every family that
+// used to be ONE dataset carrying one distribution per year ("Medicare
+// Physician & Other Practitioners - by Geography and Service", etc.) is now
+// published as SEPARATE per-year datasets, each titled
+// "<original title> : <YYYY-MM-DD>" where the date is the publication date of
+// that year's cut, not the data year — do not parse the year out of it. An
+// exact `row.title === title` match therefore now matches NOTHING for any of
+// these families, which is every tool in this pack that calls
+// catalogDistributions()/utilizationDistributions().
+//
+// Match the title PREFIX instead, tolerant of whatever separator CMS used
+// this time and the next: the base title followed by either nothing (the
+// pre-rename exact shape, so nothing that matches today stops matching) or any
+// run starting with a non-alphanumeric character. That accepts " : <date>"
+// today and a different punctuation mark or no separator before a future
+// rename, while still rejecting an unrelated title that merely happens to
+// share the same prefix word.
+function matchesCatalogTitle(rowTitle: string | undefined, title: string): boolean {
+  if (typeof rowTitle !== 'string') return false;
+  if (rowTitle === title) return true;
+  if (!rowTitle.startsWith(title)) return false;
+  const suffix = rowTitle.slice(title.length);
+  return suffix.length === 0 || /^[^a-zA-Z0-9]/.test(suffix);
+}
+
+// `distribution.temporal` used to be an ISO-8601 interval STRING
+// ("2013-01-01/2013-12-31"), so `Number(temporal.slice(0, 4))` read the year
+// as the first 4 characters. The 2026-09-29 restructuring changed every
+// distribution's `temporal` to an ARRAY of {startDate, endDate} objects.
+// `.slice(0, 4)` on an array is Array.prototype.slice (not String's), so the
+// old code silently fed `Number(someArray)` — which stringifies the one
+// PeriodOfTime object inside to "[object Object]" and produces NaN — into
+// `Number.isInteger(year)`, dropping EVERY distribution regardless of title.
+// Fixing only the title match above would still leave every tool returning
+// "CMS catalog exposed no API distributions" instead. Handle both shapes so a
+// future reversion doesn't re-break this a third way.
+function distributionYear(temporal: CatalogDistribution['temporal']): number | null {
+  let dateText: string | undefined;
+  if (typeof temporal === 'string') {
+    dateText = temporal;
+  } else if (Array.isArray(temporal) && temporal.length > 0) {
+    const period = temporal[0];
+    dateText = typeof period?.startDate === 'string' ? period.startDate
+      : typeof period?.endDate === 'string' ? period.endDate : undefined;
+  }
+  if (!dateText) return null;
+  const year = Number(dateText.slice(0, 4));
+  return Number.isInteger(year) ? year : null;
 }
 
 async function catalogDistributions(title: string): Promise<CmsDistribution[]> {
@@ -2061,18 +2115,30 @@ async function catalogDistributions(title: string): Promise<CmsDistribution[]> {
   // keeps doing its real job (refusing a runaway or an HTML error page) without
   // re-breaking the day CMS publishes another few datasets.
   const payload = await boundedJson(response, 'CMS data catalog', 32_000_000) as { dataset?: CatalogDataset[] };
-  const dataset = (payload.dataset ?? []).find((row) => row.title === title);
-  if (!dataset) throw new Error(`CMS catalog did not contain ${title}.`);
+  // A family may now be spread across several dataset rows (one per year) —
+  // collect distributions across ALL of them rather than assuming one row
+  // carries the whole history the way it used to.
+  const candidates = (payload.dataset ?? []).filter((row) => matchesCatalogTitle(row.title, title));
+  if (!candidates.length) throw new Error(`CMS catalog did not contain ${title}.`);
   const byYear = new Map<number, CmsDistribution>();
-  for (const distribution of dataset.distribution ?? []) {
-    if (distribution.format !== 'API' || !distribution.accessURL || !distribution.temporal) continue;
-    const year = Number(distribution.temporal.slice(0, 4));
-    if (!Number.isInteger(year)) continue;
-    const candidate = {
-      year, url: distribution.accessURL, modified: distribution.modified ?? null, dataset_title: title,
-    };
-    const existing = byYear.get(year);
-    if (!existing || distribution.description === 'latest') byYear.set(year, candidate);
+  for (const dataset of candidates) {
+    for (const distribution of dataset.distribution ?? []) {
+      if (distribution.format !== 'API' || !distribution.accessURL) continue;
+      const year = distributionYear(distribution.temporal);
+      if (year === null) continue;
+      const candidate = {
+        year, url: distribution.accessURL, modified: distribution.modified ?? null,
+        dataset_title: dataset.title ?? title,
+      };
+      const existing = byYear.get(year);
+      // Deliberate tiebreak, unchanged from before the restructuring: CMS can
+      // carry two API distributions for the same year in the same dataset row
+      // (confirmed live 2026-10-09 on the 2024 cut of this family — one
+      // description:"latest", one not) and never carries two dataset rows for
+      // the same year, so "latest" wins and otherwise the first one found
+      // stands.
+      if (!existing || distribution.description === 'latest') byYear.set(year, candidate);
+    }
   }
   const result = [...byYear.values()].sort((a, b) => a.year - b.year);
   if (!result.length) throw new Error(`CMS catalog exposed no API distributions for ${title}.`);

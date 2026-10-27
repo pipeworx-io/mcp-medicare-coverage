@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.pipeworx-io/medicare-coverage",
   "title": "Medicare Coverage",
-  "description": "MCP server for medicare-coverage",
-  "version": "0.1.6",
+  "description": "Medicare national and local coverage policy from the official CMS Coverage API.",
+  "version": "0.1.7",
   "websiteUrl": "https://pipeworx.io/packs/medicare-coverage",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-medicare-coverage",
